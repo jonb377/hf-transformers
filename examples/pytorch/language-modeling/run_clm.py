@@ -28,12 +28,14 @@ import sys
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
+import numpy as np
 
 import datasets
 import evaluate
 import torch
 from datasets import load_dataset
 
+import torch_xla.debug.profiler as xp
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -128,6 +130,38 @@ class ModelArguments:
                 "dtype will be automatically derived from the model's weights."
             ),
             "choices": ["auto", "bfloat16", "float16", "float32"],
+        },
+    )
+    spmd_model_sharding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Will apply XLA SPMD to shard the model Transformer blocks"
+            )
+        },
+    )
+    spmd_fsdp_sharding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Will apply XLA SPMD to run FSDP"
+            )
+        },
+    )
+    spmd_batch_sharding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Will apply XLA SPMD to shard the input along the batch dimension"
+            )
+        },
+    )
+    spmd_spatial_sharding: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Will apply XLA SPMD to shard the input along the spatial dimension"
+            )
         },
     )
 
@@ -229,6 +263,11 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    training_args.spmd_batch_sharding = model_args.spmd_batch_sharding or model_args.spmd_fsdp_sharding
+    training_args.spmd_model_sharding = model_args.spmd_model_sharding
+    training_args.spmd_fsdp_sharding = model_args.spmd_fsdp_sharding
+    training_args.spmd_spatial_sharding = model_args.spmd_spatial_sharding
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_clm", model_args, data_args)
@@ -275,6 +314,10 @@ def main():
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
+
+    server = xp.start_server(9012)
+    logger.info('Profiling server started: {str(server)}')
+
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
@@ -419,6 +462,36 @@ def main():
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
+
+    if model_args.spmd_model_sharding or model_args.spmd_fsdp_sharding:
+        import torch_xla.core.xla_model as xm
+        import torch_xla.experimental.pjrt as pjrt
+        import torch_xla.experimental.xla_sharding as xs
+        model = model.to(xm.xla_device())
+
+        num_devices = pjrt.global_device_count()
+        device_ids = np.arange(num_devices)
+
+        if model_args.spmd_model_sharding:
+            print('Applying Megatron-LM sharding')
+            mesh =  xs.Mesh(device_ids, (num_devices, 1))
+            # Apply megatron-LM sharding to the transformer blocks
+            for name, param in model.named_parameters():
+                if 'mlp.c_fc.weight' in name:
+                    xs.mark_sharding(param, mesh, (0, 1))
+                elif 'mlp.c_proj.weight' in name:
+                    xs.mark_sharding(param, mesh, (1, 0))
+        elif model_args.spmd_fsdp_sharding:
+            print('Applying FSDP sharding')
+            for name, param in model.named_parameters():
+                if len(param.shape) == 1:
+                    shape = (num_devices,)
+                elif len(param.shape) == 2:
+                    shape = (num_devices // 2, 2)
+                else:
+                    shape = (num_devices // 2, 2) + (1,) * (len(param.shape) - 2)
+                mesh =  xs.Mesh(device_ids, shape)
+                xs.mark_sharding(param, mesh, range(len(param.shape)))
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.

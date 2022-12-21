@@ -28,6 +28,7 @@ import shutil
 import sys
 import time
 import warnings
+import torch_xla.debug.profiler as xp
 from collections.abc import Mapping
 from distutils.util import strtobool
 from pathlib import Path
@@ -1834,6 +1835,7 @@ class Trainer:
                     _ = list(train_dataloader.sampler)
 
         total_batched_samples = 0
+        start = time.time()
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
@@ -1841,8 +1843,9 @@ class Trainer:
                 train_dataloader.dataset.set_epoch(epoch)
 
             if is_torch_tpu_available():
-                parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
-                epoch_iterator = parallel_loader
+                #parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
+                #epoch_iterator = parallel_loader
+                epoch_iterator = train_dataloader
             else:
                 epoch_iterator = train_dataloader
 
@@ -1870,36 +1873,81 @@ class Trainer:
 
             step = -1
             for step, inputs in enumerate(epoch_iterator):
-                total_batched_samples += 1
-                if rng_to_sync:
-                    self._load_rng_state(resume_from_checkpoint)
-                    rng_to_sync = False
 
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)
-                    if steps_trained_in_current_epoch == 0:
-                        self._load_rng_state(resume_from_checkpoint)
-                    continue
-                elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()
-                    steps_trained_progress_bar = None
+                with xp.StepTrace('train_loop'):
+                    with xp.Trace('build_graph'):
+                        total_batched_samples += 1
+                        if rng_to_sync:
+                            self._load_rng_state(resume_from_checkpoint)
+                            rng_to_sync = False
+                        # Skip past any already trained steps if resuming training
+                        if steps_trained_in_current_epoch > 0:
+                            steps_trained_in_current_epoch -= 1
+                            if steps_trained_progress_bar is not None:
+                                steps_trained_progress_bar.update(1)
+                            if steps_trained_in_current_epoch == 0:
+                                self._load_rng_state(resume_from_checkpoint)
+                            continue
+                        elif steps_trained_progress_bar is not None:
+                            steps_trained_progress_bar.close()
+                            steps_trained_progress_bar = None
 
-                if step % args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+                        if step % args.gradient_accumulation_steps == 0:
+                            self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                if (
-                    (total_batched_samples % args.gradient_accumulation_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
-                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                    with model.no_sync():
-                        tr_loss_step = self.training_step(model, inputs)
-                else:
-                    tr_loss_step = self.training_step(model, inputs)
+                        # Mark sharding on the input
+                        if args.spmd_batch_sharding or args.spmd_spatial_sharding:
+                            import torch_xla.experimental.xla_sharding as xs
+                            import torch_xla.experimental.pjrt as pjrt
+                            num_devices = pjrt.global_device_count()
+                            device_ids = np.arange(num_devices)
+                            mesh = xs.Mesh(device_ids, (num_devices, 1))
+                            inputs['input_ids'] = inputs['input_ids'].to(xm.xla_device())
+                            inputs['attention_mask'] = inputs['attention_mask'].to(xm.xla_device())
+                            if args.spmd_batch_sharding:
+                                xs.mark_sharding(inputs['input_ids'], mesh, (0, 1))
+                                xs.mark_sharding(inputs['attention_mask'], mesh, (0, 1))
+                            else:
+                                xs.mark_sharding(inputs['input_ids'], mesh, (1, 0))
+                                xs.mark_sharding(inputs['attention_mask'], mesh, (1, 0))
+                        if step == 20:
+                            def profile():
+                                from subprocess import Popen, PIPE
+                                import tempfile
+                                tmpdir = tempfile.mkdtemp()
+                                cmd = f"/usr/local/bin/python /home/jonbolin/work/pytorch/xla/scripts/capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms 10000"
+                                Popen(cmd.split()).communicate()
+
+                                labels = ['gpt2', str(args.train_batch_size)]
+                                for strat in ['batch', 'model', 'spatial', 'fsdp']:
+                                    if eval(f'args.spmd_{strat}_sharding'):
+                                        labels.append(strat)
+                                label = '_'.join(labels)
+
+                                profile_dir = f'{tmpdir}/plugins/profile/'
+                                profiles = os.listdir(profile_dir)
+                                if len(profiles) != 1:
+                                    print("Warning: multiple profiles found after a single capture", profiles, file=sys.stderr)
+
+                                autoprof_dir = f'/home/jonbolin/autoprof/plugins/profile/'
+                                os.makedirs(autoprof_dir, exist_ok=True)
+                                for profile in profiles:
+                                    shutil.move(f'{profile_dir}/{profile}', f'{autoprof_dir}/{label}_{profile}')
+
+                            import threading
+                            threading.Thread(target=profile).start()
+
+
+                        if (
+                            ((step + 1) % args.gradient_accumulation_steps != 0)
+                            and args.local_rank != -1
+                            and args._no_sync_in_gradient_accumulation
+                        ):
+                            # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                            with model.no_sync():
+                                tr_loss_step = self.training_step(model, inputs)
+                        else:
+                            tr_loss_step = self.training_step(model, inputs)
 
                 if (
                     args.logging_nan_inf_filter
@@ -1958,7 +2006,9 @@ class Trainer:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
-                            xm.optimizer_step(self.optimizer)
+                            #xm.optimizer_step(self.optimizer)
+                            self.optimizer.step()
+                            xm.mark_step()
                     elif self.do_grad_scaling:
                         scale_before = self.scaler.get_scale()
                         self.scaler.step(self.optimizer)
@@ -2004,6 +2054,15 @@ class Trainer:
                     )
             if self.control.should_training_stop:
                 break
+
+        labels = ['gpt2', str(args.train_batch_size)]
+        for strat in ['batch', 'model', 'spatial', 'fsdp']:
+            if eval(f'args.spmd_{strat}_sharding'):
+                labels.append(strat)
+        label = '_'.join(labels)
+        end = time.time()
+        with open('/home/jonbolin/epoch_durations', 'a') as f:
+            f.write(f'{label} batch_size={args.train_batch_size} epoch_duration={end - start}s\n')
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -2673,6 +2732,7 @@ class Trainer:
             labels = inputs.pop("labels")
         else:
             labels = None
+
         outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
@@ -3077,8 +3137,8 @@ class Trainer:
         # Do this before wrapping.
         eval_dataset = getattr(dataloader, "dataset", None)
 
-        if is_torch_tpu_available():
-            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
+        #if is_torch_tpu_available():
+        #    dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
 
         if args.past_index >= 0:
             self._past = None
@@ -3684,8 +3744,8 @@ class Trainer:
 
         model.eval()
 
-        if is_torch_tpu_available():
-            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
+        #if is_torch_tpu_available():
+        #    dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
 
         if args.past_index >= 0:
             self._past = None
