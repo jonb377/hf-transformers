@@ -220,6 +220,17 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
+def get_benchmark_label(args):
+    import subprocess
+    accelerator_type = subprocess.check_output(['bash', '-c', 'curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/tpu-env" 2>/dev/null | grep ACCELERATOR_TYPE | grep -o "v[0-9]-[0-9]*" | tr -d "\n"']).decode()
+    worker_id = subprocess.check_output(['bash', '-c', 'curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number" 2>/dev/null']).decode()
+    labels = [accelerator_type, worker_id, 'gpt2', str(args.train_batch_size)]
+    for strat in ['batch', 'model', 'spatial', 'fsdp']:
+        if eval(f'args.spmd_{strat}_sharding'):
+            labels.append(strat)
+    return '_'.join(labels)
+
+
 class Trainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
@@ -1843,9 +1854,19 @@ class Trainer:
                 train_dataloader.dataset.set_epoch(epoch)
 
             if is_torch_tpu_available():
-                #parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
-                #epoch_iterator = parallel_loader
-                epoch_iterator = train_dataloader
+                sharding_spec = None
+                if args.spmd_batch_sharding or args.spmd_spatial_sharding:
+                    import torch_xla.experimental.xla_sharding as xs
+                    import torch_xla.experimental.pjrt as pjrt
+                    num_devices = pjrt.global_device_count()
+                    device_ids = np.arange(num_devices)
+                    mesh = xs.Mesh(device_ids, (num_devices, 1))
+                    if args.spmd_batch_sharding:
+                        partition_spec = (0, 1)
+                    else:
+                        partition_spec = (1, 0)
+                    sharding_spec = xs.ShardingSpec(mesh, partition_spec)
+                epoch_iterator = pl.MpDeviceLoader(train_dataloader, args.device, input_sharding=sharding_spec, loader_prefetch_size=args.train_batch_size, device_prefetch_size=4)
             else:
                 epoch_iterator = train_dataloader
 
@@ -1872,9 +1893,11 @@ class Trainer:
                 rng_to_sync = True
 
             step = -1
+            profile_step = int(os.environ['PROFILE_STEP'])
+            profile_epoch = int(os.environ['PROFILE_EPOCH'])
+            xm.mark_step()
             for step, inputs in enumerate(epoch_iterator):
-
-                with xp.StepTrace('train_loop'):
+                with xp.Trace('train_loop'):
                     with xp.Trace('build_graph'):
                         total_batched_samples += 1
                         if rng_to_sync:
@@ -1895,44 +1918,28 @@ class Trainer:
                         if step % args.gradient_accumulation_steps == 0:
                             self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                        # Mark sharding on the input
-                        if args.spmd_batch_sharding or args.spmd_spatial_sharding:
-                            import torch_xla.experimental.xla_sharding as xs
-                            import torch_xla.experimental.pjrt as pjrt
-                            num_devices = pjrt.global_device_count()
-                            device_ids = np.arange(num_devices)
-                            mesh = xs.Mesh(device_ids, (num_devices, 1))
-                            inputs['input_ids'] = inputs['input_ids'].to(xm.xla_device())
-                            inputs['attention_mask'] = inputs['attention_mask'].to(xm.xla_device())
-                            if args.spmd_batch_sharding:
-                                xs.mark_sharding(inputs['input_ids'], mesh, (0, 1))
-                                xs.mark_sharding(inputs['attention_mask'], mesh, (0, 1))
-                            else:
-                                xs.mark_sharding(inputs['input_ids'], mesh, (1, 0))
-                                xs.mark_sharding(inputs['attention_mask'], mesh, (1, 0))
-                        if step == 20:
+                        if step == profile_step and epoch == profile_epoch:
                             def profile():
                                 from subprocess import Popen, PIPE
                                 import tempfile
                                 tmpdir = tempfile.mkdtemp()
-                                cmd = f"/usr/local/bin/python /home/jonbolin/work/pytorch/xla/scripts/capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms 10000"
+                                cmd = f"/usr/local/bin/python /pytorch/xla/scripts/capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms {os.environ['PROFILE_DURATION_MS']}"
                                 Popen(cmd.split()).communicate()
 
-                                labels = ['gpt2', str(args.train_batch_size)]
-                                for strat in ['batch', 'model', 'spatial', 'fsdp']:
-                                    if eval(f'args.spmd_{strat}_sharding'):
-                                        labels.append(strat)
-                                label = '_'.join(labels)
+                                label = get_benchmark_label(args)
 
                                 profile_dir = f'{tmpdir}/plugins/profile/'
                                 profiles = os.listdir(profile_dir)
                                 if len(profiles) != 1:
                                     print("Warning: multiple profiles found after a single capture", profiles, file=sys.stderr)
 
-                                autoprof_dir = f'/home/jonbolin/autoprof/plugins/profile/'
+                                autoprof_dir = f'/tmp/home/autoprof/plugins/profile/'
                                 os.makedirs(autoprof_dir, exist_ok=True)
                                 for profile in profiles:
                                     shutil.move(f'{profile_dir}/{profile}', f'{autoprof_dir}/{label}_{profile}')
+                                    cmd = f'/google-cloud-sdk/bin/gsutil cp -r {autoprof_dir}/{label}_{profile} gs://pytorch-spmd-benchmark-profile/plugins/profile/{label}_{profile}'
+                                    print(cmd)
+                                    os.system(cmd)
 
                             import threading
                             threading.Thread(target=profile).start()
@@ -1949,53 +1956,55 @@ class Trainer:
                         else:
                             tr_loss_step = self.training_step(model, inputs)
 
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                else:
-                    tr_loss += tr_loss_step
+                with xp.Trace('pre-optim-step'):
+                    if (
+                        args.logging_nan_inf_filter
+                        and not is_torch_tpu_available()
+                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    ):
+                        # if loss is nan or inf simply add the average of previous logged losses
+                        tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    else:
+                        tr_loss += tr_loss_step
 
-                self.current_flos += float(self.floating_point_ops(inputs))
+                    self.current_flos += float(self.floating_point_ops(inputs))
 
-                # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
-                if self.deepspeed:
-                    self.deepspeed.step()
+                    # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
+                    if self.deepspeed:
+                        self.deepspeed.step()
 
                 if total_batched_samples % args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
                     steps_in_epoch <= args.gradient_accumulation_steps
                     and (step + 1) == steps_in_epoch
                 ):
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
-                        # deepspeed does its own clipping
+                    with xp.Trace('gradient-clipping'):
+                        # Gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
+                            # deepspeed does its own clipping
 
-                        if self.do_grad_scaling:
-                            # Reduce gradients first for XLA
-                            if is_torch_tpu_available():
-                                gradients = xm._fetch_gradients(self.optimizer)
-                                xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
+                            if self.do_grad_scaling:
+                                # Reduce gradients first for XLA
+                                if is_torch_tpu_available():
+                                    gradients = xm._fetch_gradients(self.optimizer)
+                                    xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                                # AMP: gradients need unscaling
+                                self.scaler.unscale_(self.optimizer)
 
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif hasattr(self.optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            self.optimizer.clip_grad_norm(args.max_grad_norm)
-                        elif hasattr(model, "clip_grad_norm_"):
-                            # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                            model.clip_grad_norm_(args.max_grad_norm)
-                        else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
-                                args.max_grad_norm,
-                            )
+                            if is_sagemaker_mp_enabled() and args.fp16:
+                                self.optimizer.clip_master_grads(args.max_grad_norm)
+                            elif hasattr(self.optimizer, "clip_grad_norm"):
+                                # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                                self.optimizer.clip_grad_norm(args.max_grad_norm)
+                            elif hasattr(model, "clip_grad_norm_"):
+                                # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
+                                model.clip_grad_norm_(args.max_grad_norm)
+                            else:
+                                # Revert to normal clipping otherwise, handling Apex or full precision
+                                nn.utils.clip_grad_norm_(
+                                    amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
+                                    args.max_grad_norm,
+                                )
 
                     # Optimizer step
                     optimizer_was_run = True
@@ -2006,9 +2015,12 @@ class Trainer:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
-                            #xm.optimizer_step(self.optimizer)
-                            self.optimizer.step()
-                            xm.mark_step()
+                            mark_step = (step + 1) % self.args.spmd_mark_step_period == 0 or step == len(epoch_iterator) - 1
+                            with xp.Trace('optimizer-step'):
+                                self.optimizer.step()
+                            #if mark_step:
+                            #    with xp.StepTrace('mark-step'):
+                            #        pass
                     elif self.do_grad_scaling:
                         scale_before = self.scaler.get_scale()
                         self.scaler.step(self.optimizer)
@@ -2018,15 +2030,16 @@ class Trainer:
                     else:
                         self.optimizer.step()
 
-                    if optimizer_was_run and not self.deepspeed:
-                        self.lr_scheduler.step()
+                    with xp.Trace('post-optim-step'):
+                        if optimizer_was_run and not self.deepspeed:
+                            self.lr_scheduler.step()
 
-                    model.zero_grad()
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        model.zero_grad()
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                        self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -2055,14 +2068,12 @@ class Trainer:
             if self.control.should_training_stop:
                 break
 
-        labels = ['gpt2', str(args.train_batch_size)]
-        for strat in ['batch', 'model', 'spatial', 'fsdp']:
-            if eval(f'args.spmd_{strat}_sharding'):
-                labels.append(strat)
-        label = '_'.join(labels)
+        label = get_benchmark_label(args)
         end = time.time()
-        with open('/home/jonbolin/epoch_durations', 'a') as f:
-            f.write(f'{label} batch_size={args.train_batch_size} epoch_duration={end - start}s\n')
+        with open('/tmp/home/epoch_durations', 'a') as f:
+            log = f'{label} batch_size={args.train_batch_size} epoch_duration={end - start}s'
+            f.write(f'{log}\n')
+            print(log)
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -2263,7 +2274,8 @@ class Trainer:
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval):
         if self.control.should_log:
             if is_torch_tpu_available():
-                xm.mark_step()
+                with xp.StepTrace('log_save_eval_mark_step'):
+                    pass
 
             logs: Dict[str, float] = {}
 
@@ -2630,7 +2642,8 @@ class Trainer:
                 # embedding. Other models such as wav2vec2's inputs are already float and thus
                 # may need special handling to match the dtypes of the model
                 kwargs.update({"dtype": self.args.hf_deepspeed_config.dtype()})
-            return data.to(**kwargs)
+            with xp.Trace('data_transfer'):
+                return data.to(**kwargs)
         return data
 
     def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
@@ -2785,7 +2798,9 @@ class Trainer:
             output_dir = self.args.output_dir
 
         if is_torch_tpu_available():
-            self._save_tpu(output_dir)
+            # TODO(jonbolin): Writing checkpoint is broken for SPMD 
+            #self._save_tpu(output_dir)
+            pass
         elif is_sagemaker_mp_enabled():
             # Calling the state_dict needs to be done on the wrapped model and on all processes.
             os.makedirs(output_dir, exist_ok=True)
