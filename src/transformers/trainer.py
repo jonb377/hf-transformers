@@ -220,6 +220,17 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
+def get_benchmark_label(args):
+    import subprocess
+    accelerator_type = subprocess.check_output(['bash', '-c', 'curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/tpu-env" 2>/dev/null | grep ACCELERATOR_TYPE | grep -o "v[0-9]-[0-9]*" | tr -d "\n"']).decode()
+    worker_id = subprocess.check_output(['bash', '-c', 'curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number" 2>/dev/null']).decode()
+    labels = [accelerator_type, worker_id, 'gpt2', str(args.train_batch_size)]
+    for strat in ['batch', 'model', 'spatial', 'fsdp']:
+        if eval(f'args.spmd_{strat}_sharding'):
+            labels.append(strat)
+    return '_'.join(labels)
+
+
 class Trainer:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
@@ -862,6 +873,7 @@ class Trainer:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
         if isinstance(train_dataset, torch.utils.data.IterableDataset):
+            print('iterable dataset; world_size=', self.args.world_size)
             if self.args.world_size > 1:
                 train_dataset = IterableDatasetShard(
                     train_dataset,
@@ -879,6 +891,7 @@ class Trainer:
                 pin_memory=self.args.dataloader_pin_memory,
             )
 
+        print('creating a sampler')
         train_sampler = self._get_train_sampler()
 
         return DataLoader(
@@ -1843,9 +1856,23 @@ class Trainer:
                 train_dataloader.dataset.set_epoch(epoch)
 
             if is_torch_tpu_available():
-                #parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
-                #epoch_iterator = parallel_loader
-                epoch_iterator = train_dataloader
+                sharding_spec = None
+                if args.spmd_batch_sharding or args.spmd_spatial_sharding:
+                    def do_shard(inp):
+                        import torch_xla.experimental.xla_sharding as xs
+                        import torch_xla.experimental.pjrt as pjrt
+                        num_devices = pjrt.global_device_count()
+                        device_ids = np.arange(num_devices)
+                        mesh = xs.Mesh(device_ids, (num_devices, 1))
+                        if args.spmd_batch_sharding:
+                            partition_spec = (0, 1)
+                        else:
+                            partition_spec = (1, 0)
+                        with xp.Trace('mark_sharding'):
+                            for tensor in inp:
+                                xs.mark_sharding(tensor, mesh, partition_spec)
+                    sharding_spec = do_shard
+                epoch_iterator = pl.MpDeviceLoader(train_dataloader, args.device, input_sharding=sharding_spec)
             else:
                 epoch_iterator = train_dataloader
 
@@ -1872,6 +1899,8 @@ class Trainer:
                 rng_to_sync = True
 
             step = -1
+            profile_step = int(os.environ['PROFILE_STEP'])
+            profile_epoch = int(os.environ['PROFILE_EPOCH'])
             for step, inputs in enumerate(epoch_iterator):
 
                 with xp.StepTrace('train_loop'):
@@ -1895,44 +1924,26 @@ class Trainer:
                         if step % args.gradient_accumulation_steps == 0:
                             self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                        # Mark sharding on the input
-                        if args.spmd_batch_sharding or args.spmd_spatial_sharding:
-                            import torch_xla.experimental.xla_sharding as xs
-                            import torch_xla.experimental.pjrt as pjrt
-                            num_devices = pjrt.global_device_count()
-                            device_ids = np.arange(num_devices)
-                            mesh = xs.Mesh(device_ids, (num_devices, 1))
-                            inputs['input_ids'] = inputs['input_ids'].to(xm.xla_device())
-                            inputs['attention_mask'] = inputs['attention_mask'].to(xm.xla_device())
-                            if args.spmd_batch_sharding:
-                                xs.mark_sharding(inputs['input_ids'], mesh, (0, 1))
-                                xs.mark_sharding(inputs['attention_mask'], mesh, (0, 1))
-                            else:
-                                xs.mark_sharding(inputs['input_ids'], mesh, (1, 0))
-                                xs.mark_sharding(inputs['attention_mask'], mesh, (1, 0))
-                        if step == 20:
+                        if step == profile_step and epoch == profile_epoch:
                             def profile():
                                 from subprocess import Popen, PIPE
                                 import tempfile
                                 tmpdir = tempfile.mkdtemp()
-                                cmd = f"/usr/local/bin/python /home/jonbolin/work/pytorch/xla/scripts/capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms 10000"
+                                cmd = f"/usr/local/bin/python /pytorch/xla/scripts/capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms {os.environ['PROFILE_DURATION_MS']}"
                                 Popen(cmd.split()).communicate()
 
-                                labels = ['gpt2', str(args.train_batch_size)]
-                                for strat in ['batch', 'model', 'spatial', 'fsdp']:
-                                    if eval(f'args.spmd_{strat}_sharding'):
-                                        labels.append(strat)
-                                label = '_'.join(labels)
+                                label = get_benchmark_label(args)
 
                                 profile_dir = f'{tmpdir}/plugins/profile/'
                                 profiles = os.listdir(profile_dir)
                                 if len(profiles) != 1:
                                     print("Warning: multiple profiles found after a single capture", profiles, file=sys.stderr)
 
-                                autoprof_dir = f'/home/jonbolin/autoprof/plugins/profile/'
+                                autoprof_dir = f'/tmp/home/autoprof/plugins/profile/'
                                 os.makedirs(autoprof_dir, exist_ok=True)
                                 for profile in profiles:
                                     shutil.move(f'{profile_dir}/{profile}', f'{autoprof_dir}/{label}_{profile}')
+                                    os.system(f'/usr/bin/gsutil cp -r {autoprof_dir}/{label}_{profile} gs://pytorch-spmd-benchmark-profile/plugins/profile/{label}_{profile}')
 
                             import threading
                             threading.Thread(target=profile).start()
@@ -2006,9 +2017,7 @@ class Trainer:
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                         else:
-                            #xm.optimizer_step(self.optimizer)
-                            self.optimizer.step()
-                            xm.mark_step()
+                            xm.optimizer_step(self.optimizer)
                     elif self.do_grad_scaling:
                         scale_before = self.scaler.get_scale()
                         self.scaler.step(self.optimizer)
@@ -2055,14 +2064,12 @@ class Trainer:
             if self.control.should_training_stop:
                 break
 
-        labels = ['gpt2', str(args.train_batch_size)]
-        for strat in ['batch', 'model', 'spatial', 'fsdp']:
-            if eval(f'args.spmd_{strat}_sharding'):
-                labels.append(strat)
-        label = '_'.join(labels)
+        label = get_benchmark_label(args)
         end = time.time()
-        with open('/home/jonbolin/epoch_durations', 'a') as f:
-            f.write(f'{label} batch_size={args.train_batch_size} epoch_duration={end - start}s\n')
+        with open('/tmp/home/epoch_durations', 'a') as f:
+            log = f'{label} batch_size={args.train_batch_size} epoch_duration={end - start}s'
+            f.write(f'{log}\n')
+            print(log)
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -2630,7 +2637,8 @@ class Trainer:
                 # embedding. Other models such as wav2vec2's inputs are already float and thus
                 # may need special handling to match the dtypes of the model
                 kwargs.update({"dtype": self.args.hf_deepspeed_config.dtype()})
-            return data.to(**kwargs)
+            with xp.Trace('data_transfer'):
+                return data.to(**kwargs)
         return data
 
     def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
@@ -2785,7 +2793,9 @@ class Trainer:
             output_dir = self.args.output_dir
 
         if is_torch_tpu_available():
-            self._save_tpu(output_dir)
+            # TODO(jonbolin): Writing checkpoint is broken for SPMD 
+            #self._save_tpu(output_dir)
+            pass
         elif is_sagemaker_mp_enabled():
             # Calling the state_dict needs to be done on the wrapped model and on all processes.
             os.makedirs(output_dir, exist_ok=True)

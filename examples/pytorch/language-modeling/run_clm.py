@@ -472,7 +472,19 @@ def main():
         num_devices = pjrt.global_device_count()
         device_ids = np.arange(num_devices)
 
-        if model_args.spmd_model_sharding:
+        if model_args.spmd_model_sharding and model_args.spmd_fsdp_sharding:
+            mesh =  xs.Mesh(device_ids, (num_devices, 1))
+            # Combine tensor parallelism on MLP with FSDP on attention layers
+            for name, param in model.named_parameters():
+                if 'mlp.c_fc.weight' in name:
+                    xs.mark_sharding(param, mesh, (0, 1))
+                elif 'mlp.c_proj.weight' in name:
+                    xs.mark_sharding(param, mesh, (1, 0))
+                elif 'attn.c_attn.weight' in name:
+                    xs.mark_sharding(param, mesh, (0, 1))
+                elif 'attn.c_proj.weight' in name:
+                    xs.mark_sharding(param, mesh, (0, 1))
+        elif model_args.spmd_model_sharding:
             print('Applying Megatron-LM sharding')
             mesh =  xs.Mesh(device_ids, (num_devices, 1))
             # Apply megatron-LM sharding to the transformer blocks
