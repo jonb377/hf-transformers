@@ -1563,6 +1563,24 @@ class Trainer:
 
         return model
 
+    def _xla_sharded_dataloader(self, dataloader):
+        if is_torch_tpu_available():
+            sharding_spec = None
+            if self.args.spmd_batch_sharding or self.args.spmd_spatial_sharding:
+                import torch_xla.experimental.xla_sharding as xs
+                import torch_xla.experimental.pjrt as pjrt
+                num_devices = pjrt.global_device_count()
+                device_ids = np.arange(num_devices)
+                mesh = xs.Mesh(device_ids, (num_devices, 1))
+                if self.args.spmd_batch_sharding:
+                    partition_spec = (0, 1)
+                else:
+                    partition_spec = (1, 0)
+                sharding_spec = xs.ShardingSpec(mesh, partition_spec)
+            return pl.MpDeviceLoader(dataloader, self.args.device, input_sharding=sharding_spec, loader_prefetch_size=self.args.train_batch_size, device_prefetch_size=4)
+        else:
+            return dataloader
+
     def train(
         self,
         resume_from_checkpoint: Optional[Union[str, bool]] = None,
@@ -1853,22 +1871,7 @@ class Trainer:
             elif hasattr(train_dataloader, "dataset") and isinstance(train_dataloader.dataset, IterableDatasetShard):
                 train_dataloader.dataset.set_epoch(epoch)
 
-            if is_torch_tpu_available():
-                sharding_spec = None
-                if args.spmd_batch_sharding or args.spmd_spatial_sharding:
-                    import torch_xla.experimental.xla_sharding as xs
-                    import torch_xla.experimental.pjrt as pjrt
-                    num_devices = pjrt.global_device_count()
-                    device_ids = np.arange(num_devices)
-                    mesh = xs.Mesh(device_ids, (num_devices, 1))
-                    if args.spmd_batch_sharding:
-                        partition_spec = (0, 1)
-                    else:
-                        partition_spec = (1, 0)
-                    sharding_spec = xs.ShardingSpec(mesh, partition_spec)
-                epoch_iterator = pl.MpDeviceLoader(train_dataloader, args.device, input_sharding=sharding_spec, loader_prefetch_size=args.train_batch_size, device_prefetch_size=4)
-            else:
-                epoch_iterator = train_dataloader
+            epoch_iterator = self._xla_sharded_dataloader(train_dataloader)
 
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
@@ -2999,7 +3002,7 @@ class Trainer:
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
 
-        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        eval_dataloader = self._xla_sharded_dataloader(self.get_eval_dataloader(eval_dataset))
         start_time = time.time()
 
         eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
