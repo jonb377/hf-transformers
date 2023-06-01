@@ -1899,7 +1899,9 @@ class Trainer:
             profile_step = int(os.environ['PROFILE_STEP'])
             profile_epoch = int(os.environ['PROFILE_EPOCH'])
             xm.mark_step()
+            import torch_xla
             for step, inputs in enumerate(epoch_iterator):
+                print({k: (v.shape, torch_xla._XLAC._get_xla_sharding_spec(v)) for k, v in inputs.items()})
                 with xp.Trace('train_loop'):
                     with xp.Trace('build_graph'):
                         total_batched_samples += 1
@@ -2298,7 +2300,7 @@ class Trainer:
             self.log(logs)
 
         metrics = None
-        if self.control.should_evaluate:
+        if self.control.should_evaluate and False:
             if isinstance(self.eval_dataset, dict):
                 for eval_dataset_name, eval_dataset in self.eval_dataset.items():
                     metrics = self.evaluate(
@@ -2801,8 +2803,7 @@ class Trainer:
             output_dir = self.args.output_dir
 
         if is_torch_tpu_available():
-            # TODO(jonbolin): Writing checkpoint is broken for SPMD 
-            #self._save_tpu(output_dir)
+            self._save_tpu(output_dir)
             pass
         elif is_sagemaker_mp_enabled():
             # Calling the state_dict needs to be done on the wrapped model and on all processes.
