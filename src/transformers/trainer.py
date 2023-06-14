@@ -1900,8 +1900,13 @@ class Trainer:
             profile_epoch = int(os.environ['PROFILE_EPOCH'])
             xm.mark_step()
             import torch_xla
+            from datetime import datetime 
+            import torch_xla.debug.metrics as met
             for step, inputs in enumerate(epoch_iterator):
-                print({k: (v.shape, torch_xla._XLAC._get_xla_sharding_spec(v)) for k, v in inputs.items()})
+                print()
+                print(f'step {step} at {datetime.now()}')
+                print('input sharding', {k: (v.shape, torch_xla._XLAC._get_xla_sharding_spec(v)) for k, v in inputs.items()})
+                print('CompileTime', met.metric_data('CompileTime'))
                 with xp.Trace('train_loop'):
                     with xp.Trace('build_graph'):
                         total_batched_samples += 1
