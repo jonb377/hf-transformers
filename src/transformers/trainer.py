@@ -1900,7 +1900,7 @@ class Trainer:
             profile_epoch = int(os.environ['PROFILE_EPOCH'])
             xm.mark_step()
             import torch_xla
-            from datetime import datetime 
+            from datetime import datetime
             import torch_xla.debug.metrics as met
             for step, inputs in enumerate(epoch_iterator):
                 print()
@@ -1933,7 +1933,7 @@ class Trainer:
                                 from subprocess import Popen, PIPE
                                 import tempfile
                                 tmpdir = tempfile.mkdtemp()
-                                cmd = f"/usr/local/bin/python /pytorch/xla/scripts/capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms {os.environ['PROFILE_DURATION_MS']}"
+                                cmd = f"/usr/local/bin/python capture_profile.py --service_addr 127.0.0.1:9012 --logdir {tmpdir} --duration_ms {os.environ['PROFILE_DURATION_MS']}"
                                 Popen(cmd.split()).communicate()
 
                                 label = get_benchmark_label(args)
@@ -1947,7 +1947,7 @@ class Trainer:
                                 os.makedirs(autoprof_dir, exist_ok=True)
                                 for profile in profiles:
                                     shutil.move(f'{profile_dir}/{profile}', f'{autoprof_dir}/{label}_{profile}')
-                                    cmd = f'/google-cloud-sdk/bin/gsutil cp -r {autoprof_dir}/{label}_{profile} gs://pytorch-spmd-benchmark-profile/plugins/profile/{label}_{profile}'
+                                    cmd = f'/usr/bin/gsutil cp -r {autoprof_dir}/{label}_{profile} gs://jwtan/plugins/profile/{label}_{profile}'
                                     print(cmd)
                                     os.system(cmd)
 
@@ -2080,7 +2080,7 @@ class Trainer:
 
         label = get_benchmark_label(args)
         end = time.time()
-        with open('/tmp/home/epoch_durations', 'a') as f:
+        with open('epoch_durations', 'a') as f:
             log = f'{label} batch_size={args.train_batch_size} epoch_duration={end - start}s'
             f.write(f'{log}\n')
             print(log)
