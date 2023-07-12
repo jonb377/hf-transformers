@@ -295,7 +295,7 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    training_args.spmd_batch_sharding = model_args.spmd_batch_sharding or model_args.spmd_fsdp_sharding
+    training_args.spmd_batch_sharding = model_args.spmd_batch_sharding #or model_args.spmd_fsdp_sharding
     training_args.spmd_model_sharding = model_args.spmd_model_sharding
     training_args.spmd_fsdp_sharding = model_args.spmd_fsdp_sharding
     training_args.spmd_spatial_sharding = model_args.spmd_spatial_sharding
