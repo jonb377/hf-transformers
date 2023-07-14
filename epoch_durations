@@ -17,3 +17,5 @@ v4-8_0_gpt2_32_batch_fsdp batch_size=32 epoch_duration=471.6615617275238s
 v4-8_0_gpt2_8_batch_fsdp batch_size=8 epoch_duration=1143.7547261714935s
 v4-8_0_gpt2_64_batch_fsdp batch_size=64 epoch_duration=647.0588886737823s
 v4-8_0_gpt2_32_batch_fsdp batch_size=32 epoch_duration=655.6127529144287s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=725.5837156772614s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=529.3210961818695s

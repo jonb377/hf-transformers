@@ -531,7 +531,7 @@ def main():
         print('Applying FSDP sharding to all parameters')
         for name, param in model.named_parameters():
             # Shard all parameters along a single axis
-            print(name, param.numel())
+            print(name, param.shape)
             shape = (num_devices,) + (1,) * (len(param.shape) - 1)
             mesh = xs.Mesh(device_ids, shape)
             xs.mark_sharding(param, mesh, range(len(param.shape)))

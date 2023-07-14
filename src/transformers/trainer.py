@@ -2015,6 +2015,19 @@ class Trainer:
                                     amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
                                     args.max_grad_norm,
                                 )
+                    if (args.spmd_fsdp_sharding):
+                        import torch_xla.experimental.xla_sharding as xs
+                        import torch_xla.experimental.pjrt as pjrt
+                        num_devices = pjrt.global_device_count()
+                        device_ids = np.arange(num_devices)
+
+                        for name, param in model.named_parameters():
+                            # Shard gradients
+                            grad = param.grad
+                            # Shard all gradients along a single axis
+                            shape = (num_devices,) + (1,) * (len(grad.shape) - 1)
+                            mesh = xs.Mesh(device_ids, shape)
+                            xs.mark_sharding(grad, mesh, range(len(grad.shape)))
 
                     # Optimizer step
                     optimizer_was_run = True
