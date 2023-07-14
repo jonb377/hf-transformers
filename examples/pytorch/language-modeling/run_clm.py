@@ -513,10 +513,10 @@ def main():
 
     if model_args.spmd_model_sharding:
         print('Applying Megatron-LM sharding to attention and MLP layers')
-        row_mesh =  xs.Mesh(device_ids, (num_devices, 1))
-        col_mesh =  xs.Mesh(device_ids, (1, num_devices))
+        row_mesh =  xs.Mesh(device_ids, (num_devices // 4, 4), ('data', 'model'))
+        col_mesh =  xs.Mesh(device_ids, (4, num_devices // 4), ('model', 'data'))
         for name, param in model.named_parameters():
-            if 'attn.c_attn.weight' in name and model_args.spmd_qkv_sharding:
+            if 'attn.c_attn.weight' in name:
                 xs.mark_sharding(param, row_mesh, (0, 1))
             elif 'attn.c_proj.weight' in name:
                 # Attention proj weight is ExE, shard column-wise

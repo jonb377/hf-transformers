@@ -1566,16 +1566,20 @@ class Trainer:
     def _xla_sharded_dataloader(self, dataloader):
         if is_torch_tpu_available():
             sharding_spec = None
+            import torch_xla.experimental.xla_sharding as xs
+            import torch_xla.experimental.pjrt as pjrt
+            num_devices = pjrt.global_device_count()
+            device_ids = np.arange(num_devices)
             if self.args.spmd_batch_sharding or self.args.spmd_spatial_sharding:
-                import torch_xla.experimental.xla_sharding as xs
-                import torch_xla.experimental.pjrt as pjrt
-                num_devices = pjrt.global_device_count()
-                device_ids = np.arange(num_devices)
                 mesh = xs.Mesh(device_ids, (num_devices, 1))
                 if self.args.spmd_batch_sharding:
                     partition_spec = (0, 1)
                 else:
                     partition_spec = (1, 0)
+                sharding_spec = xs.ShardingSpec(mesh, partition_spec)
+            elif self.args.spmd_model_sharding:
+                mesh = xs.Mesh(device_ids, (num_devices // 4, 4))
+                partition_spec = (0, None)
                 sharding_spec = xs.ShardingSpec(mesh, partition_spec)
             return pl.MpDeviceLoader(dataloader, self.args.device, input_sharding=sharding_spec, loader_prefetch_size=self.args.train_batch_size, device_prefetch_size=4)
         else:
