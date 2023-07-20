@@ -1907,6 +1907,9 @@ class Trainer:
             from datetime import datetime
             import torch_xla.debug.metrics as met
             for step, inputs in enumerate(epoch_iterator):
+                # if step > 0:
+                #     break
+
                 print()
                 print(f'step {step} at {datetime.now()}')
                 print('input sharding', {k: (v.shape, torch_xla._XLAC._get_xla_sharding_spec(v)) for k, v in inputs.items()})
