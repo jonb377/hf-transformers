@@ -39,3 +39,6 @@ v4-8_0_gpt2_160_batch batch_size=160 epoch_duration=263.7355263233185s
 v4-8_0_gpt2_80_batch batch_size=80 epoch_duration=385.9450569152832s
 v4-8_0_gpt2_128_batch batch_size=128 epoch_duration=373.7367911338806s
 v4-8_0_gpt2_160_batch batch_size=160 epoch_duration=312.99680399894714s
+v4-8_0_gpt2_128_batch batch_size=128 epoch_duration=371.3195090293884s
+v4-8_0_gpt2_16_tensor batch_size=16 epoch_duration=448.7871904373169s
+v4-8_0_gpt2_32_tensor batch_size=32 epoch_duration=421.8649642467499s

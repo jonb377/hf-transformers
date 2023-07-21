@@ -225,7 +225,7 @@ def get_benchmark_label(args):
     accelerator_type = subprocess.check_output(['bash', '-c', 'curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/tpu-env" 2>/dev/null | grep ACCELERATOR_TYPE | grep -o "v[0-9]-[0-9]*" | tr -d "\n"']).decode()
     worker_id = subprocess.check_output(['bash', '-c', 'curl -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/agent-worker-number" 2>/dev/null']).decode()
     labels = [accelerator_type, worker_id, 'gpt2', str(args.train_batch_size)]
-    for strat in ['batch', 'model', 'spatial', 'fsdp']:
+    for strat in ['batch', 'model', 'spatial', 'fsdp', 'tensor']:
         if eval(f'args.spmd_{strat}_sharding'):
             labels.append(strat)
     return '_'.join(labels)
@@ -1582,7 +1582,7 @@ class Trainer:
                 partition_spec = (0, None)
                 sharding_spec = xs.ShardingSpec(mesh, partition_spec)
             elif self.args.spmd_tensor_sharding > 0:
-                tensor = model_args.spmd_tensor_sharding
+                tensor = self.args.spmd_tensor_sharding
                 fsdp = num_devices // tensor
                 mesh = xs.Mesh(device_ids, (fsdp, tensor))
                 partition_spec = (0, None)
