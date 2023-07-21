@@ -28,3 +28,8 @@ v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=454.1132478713989s
 v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=135.50765776634216s
 v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=138.79413604736328s
 v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=463.0743863582611s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=445.439954996109s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=138.09607768058777s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=453.1224811077118s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=465.1544885635376s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=475.73764276504517s
