@@ -1581,6 +1581,12 @@ class Trainer:
                 mesh = xs.Mesh(device_ids, (num_devices // 4, 4))
                 partition_spec = (0, None)
                 sharding_spec = xs.ShardingSpec(mesh, partition_spec)
+            elif self.args.spmd_tensor_sharding > 0:
+                tensor = model_args.spmd_tensor_sharding
+                fsdp = num_devices // tensor
+                mesh = xs.Mesh(device_ids, (fsdp, tensor))
+                partition_spec = (0, None)
+                sharding_spec = xs.ShardingSpec(mesh, partition_spec)
             return pl.MpDeviceLoader(dataloader, self.args.device, input_sharding=sharding_spec, loader_prefetch_size=self.args.train_batch_size, device_prefetch_size=4)
         else:
             return dataloader

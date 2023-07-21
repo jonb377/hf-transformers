@@ -196,11 +196,11 @@ class ModelArguments:
             )
         },
     )
-    spmd_2dims_sharding: bool = field(
-        default=False,
+    spmd_tensor_sharding: int = field(
+        default=0,
         metadata={
             "help": (
-                "Will apply XLA SPMD to shard the weights along two dimensions"
+                "Will apply XLA SPMD to shard the weights along two dimensions (num_devices / spmd_tensor_sharding, spmd_tensor_sharding)"
             )
         },
     )
@@ -307,7 +307,7 @@ def main():
     training_args.spmd_model_sharding = model_args.spmd_model_sharding
     training_args.spmd_fsdp_sharding = model_args.spmd_fsdp_sharding
     training_args.spmd_spatial_sharding = model_args.spmd_spatial_sharding
-    training_args.spmd_2dims_sharding = model_args.spmd_2dims_sharding
+    training_args.spmd_tensor_sharding = model_args.spmd_tensor_sharding
     training_args.spmd_mark_step_period = model_args.spmd_mark_step_period
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
@@ -546,20 +546,19 @@ def main():
             shape[max_dim] = num_devices
             mesh = xs.Mesh(device_ids, tuple(shape))
             xs.mark_sharding(param, mesh, range(len(param.shape)))
-    elif model_args.spmd_2dims_sharding:
+    elif model_args.spmd_tensor_sharding > 0:
         print('Applying 2 dimensions sharding to all parameters')
         for name, param in model.named_parameters():
             # Shard all parameters along two axis except 1D tensors
             print(name, param.shape)
+            tensor = model_args.spmd_tensor_sharding
+            fsdp = num_devices // tensor
+            assert fsdp * tensor == num_devices
+            mesh = xs.Mesh(device_ids, (fsdp, tensor))
             if len(param.shape) == 1:
-                mesh = xs.Mesh(device_ids, (num_devices))
-                xs.mark_sharding(param, mesh, (0,))
+                xs.mark_sharding(param, mesh, (1,))
             else:
                 assert len(param.shape) == 2
-                fsdp = int(np.sqrt(num_devices))
-                tensor = num_devices // fsdp
-                assert fsdp * tensor == num_devices
-                mesh = xs.Mesh(device_ids, (fsdp, tensor))
                 xs.mark_sharding(param, mesh, range(len(param.shape)))
     #elif model_args.spmd_spatial_sharding:
     #    mesh = xs.Mesh(device_ids, (num_devices, 1))
