@@ -42,3 +42,16 @@ v4-8_0_gpt2_160_batch batch_size=160 epoch_duration=312.99680399894714s
 v4-8_0_gpt2_128_batch batch_size=128 epoch_duration=371.3195090293884s
 v4-8_0_gpt2_16_tensor batch_size=16 epoch_duration=448.7871904373169s
 v4-8_0_gpt2_32_tensor batch_size=32 epoch_duration=421.8649642467499s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=460.0499987602234s
+v4-8_0_gpt2_64_batch_fsdp batch_size=64 epoch_duration=557.6213059425354s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=469.2149896621704s
+v4-8_0_gpt2_64_batch_tensor batch_size=64 epoch_duration=481.5191960334778s
+v4-8_0_gpt2_64_batch_fsdp batch_size=64 epoch_duration=516.598441362381s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=505.83480167388916s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=4793.254544734955s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=168.25605177879333s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=165.75641250610352s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=164.95619463920593s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=510.65406489372253s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=176.15882468223572s
+v4-8_0_gpt2_128_batch_fsdp batch_size=128 epoch_duration=169.65171456336975s

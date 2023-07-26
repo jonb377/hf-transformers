@@ -2081,6 +2081,18 @@ class Trainer:
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+
+                # Let's only materialize the weights, optimzier's moving averages for the grad, loss.
+                tensors = [param for _, param in model.named_parameters()]
+                optimizer_raw_states = [raw_state for _, raw_state in self.optimizer.state.items()]
+                optimizer_states = []
+                for raw_state in optimizer_raw_states:
+                    for _, state in raw_state.items():
+                        if isinstance(state, torch.Tensor):
+                            optimizer_states.append(state)
+
+                torch_xla._XLAC._xla_sync_multi(tensors + optimizer_states + [tr_loss], devices=[], wait=False)
+                torch_xla._XLAC._clear_pending_irs(str(xm.xla_device()))
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
