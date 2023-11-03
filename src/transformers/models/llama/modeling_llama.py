@@ -384,6 +384,8 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
+            act_partition_spec = (('dcn', 'data'), None, None)
+            xs.mark_sharding(x, self.spmd_mesh, act_partition_spec)
             up_proj = self.up_proj(x)
             # Apply 2D sharding:
             # up_proj (batch, length, intermediate)
